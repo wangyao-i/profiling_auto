@@ -113,15 +113,105 @@ class AscendProfiler:
         
         if isinstance(data, dict) and 'traceEvents' in data:
             events = data['traceEvents']
+            print(f"共加载 {len(events)} 个事件")
+            
+            # 先收集所有事件名称，用于调试
+            all_event_names = list(set(e.get('name', '') for e in events if 'name' in e))
+            print(f"事件名称列表（前20个）: {all_event_names[:20]}")
+            
+            # 处理带有dur字段的完整事件和B/E配对事件
             for phase in phases:
-                phase_events = [e for e in events if phase in e.get('name', '').lower()]
+                print(f"\n正在分析阶段: {phase}")
+                
+                # 匹配包含阶段名称的事件（不区分大小写）
+                phase_events = [e for e in events if phase.lower() in e.get('name', '').lower()]
+                print(f"找到 {len(phase_events)} 个与 '{phase}' 相关的事件")
+                
                 if phase_events:
-                    phase_time = sum(e.get('dur', 0) for e in phase_events)
-                    phase_times[phase] = phase_time
+                    # 计算所有带有dur字段的事件的总时间
+                    dur_events = [e for e in phase_events if 'dur' in e]
+                    dur_time = sum(e['dur'] for e in dur_events)
+                    print(f"  - 带有dur字段的事件: {len(dur_events)} 个, 总时间: {dur_time} ns")
+                    
+                    # 处理B/E配对事件（更健壮的匹配）
+                    # 先按id分组
+                    events_by_id = {}
+                    for e in phase_events:
+                        event_id = e.get('id', '')
+                        if event_id:
+                            if event_id not in events_by_id:
+                                events_by_id[event_id] = []
+                            events_by_id[event_id].append(e)
+                    
+                    be_duration = 0
+                    matched_pairs = 0
+                    
+                    for event_id, id_events in events_by_id.items():
+                        if len(id_events) >= 2:
+                            # 查找开始和结束事件
+                            begin_event = next((e for e in id_events if e.get('ph') == 'B'), None)
+                            end_event = next((e for e in id_events if e.get('ph') == 'E'), None)
+                            
+                            if begin_event and end_event:
+                                start_ts = begin_event.get('ts', 0)
+                                end_ts = end_event.get('ts', 0)
+                                if end_ts > start_ts:
+                                    be_duration += (end_ts - start_ts)
+                                    matched_pairs += 1
+                    
+                    print(f"  - B/E配对事件: {matched_pairs} 对, 总时间: {be_duration} ns")
+                    
+                    # 尝试基于线程和时间戳匹配B/E事件（如果没有id字段）
+                    thread_events = {}
+                    for e in phase_events:
+                        thread_id = e.get('tid', e.get('pid', 'unknown'))
+                        if thread_id not in thread_events:
+                            thread_events[thread_id] = []
+                        thread_events[thread_id].append(e)
+                    
+                    thread_be_duration = 0
+                    thread_matched = 0
+                    
+                    for thread_id, thread_event_list in thread_events.items():
+                        # 按时间戳排序
+                        sorted_events = sorted(thread_event_list, key=lambda x: x.get('ts', 0))
+                        
+                        # 简单的B/E匹配（假设B后紧跟E）
+                        i = 0
+                        while i < len(sorted_events) - 1:
+                            if sorted_events[i].get('ph') == 'B' and sorted_events[i+1].get('ph') == 'E':
+                                start_ts = sorted_events[i].get('ts', 0)
+                                end_ts = sorted_events[i+1].get('ts', 0)
+                                if end_ts > start_ts:
+                                    thread_be_duration += (end_ts - start_ts)
+                                    thread_matched += 1
+                                i += 2  # 跳过这对B/E事件
+                            else:
+                                i += 1
+                    
+                    if thread_matched > 0:
+                        print(f"  - 基于线程的B/E配对: {thread_matched} 对, 总时间: {thread_be_duration} ns")
+                        be_duration += thread_be_duration
+                    
+                    # 合并所有类型的事件时间
+                    total_phase_time = dur_time + be_duration
+                    print(f"  - 阶段总时间: {total_phase_time} ns")
+                    
+                    if total_phase_time > 0:
+                        phase_times[phase] = total_phase_time
             
             total_time = sum(phase_times.values())
+            print(f"\n所有阶段总时间: {total_time} ns")
+            
             if total_time > 0:
                 results['phase_distribution'] = {p: (t / total_time * 100) for p, t in phase_times.items()}
+                print("阶段时间分布:")
+                for phase, percentage in results['phase_distribution'].items():
+                    print(f"  {phase}: {percentage:.2f}%")
+            else:
+                # 如果没有找到匹配的事件，尝试直接搜索所有事件
+                print("\n警告：没有找到与vLLM阶段相关的事件！")
+                print("请检查trace文件格式或尝试使用更通用的分析工具。")
         
         self.analysis_results['vllm'] = results
     
